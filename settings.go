@@ -17,8 +17,13 @@ const saveDelay = 300 * time.Millisecond
 // defaultParams 返回出厂默认参数（与 glass 包保持一致）。
 func defaultParams() Params {
 	return Params{
+		Device:      DeviceMouse,
 		DeadzoneDeg: glass.DefaultDeadzoneDeg,
 		Sensitivity: glass.DefaultSensitivity,
+		DSU: DSUParams{
+			Port: glass.DSUDefaultPort,
+			Slot: 1,
+		},
 	}
 }
 

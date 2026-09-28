@@ -5,6 +5,8 @@ package main
 import (
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/lxn/walk"
@@ -18,6 +20,12 @@ const (
 	valueWidth = 96  // 滑块右侧当前值宽度
 )
 
+// 模拟设备下拉框的显示文本与对应标识，两者按下标一一对应。
+var (
+	deviceNames  = []string{"鼠标", "NS Pro 手柄（DSU）"}
+	deviceValues = []string{DeviceMouse, DeviceDSU}
+)
+
 // ui 持有窗口控件与运行时对象，所有界面操作都发生在 walk 的消息循环线程上。
 type ui struct {
 	mw  *walk.MainWindow
@@ -28,10 +36,19 @@ type ui struct {
 	stateLabel *walk.Label
 	hintLabel  *walk.Label
 
+	deviceBox *walk.ComboBox
+	mouseBox  *walk.Composite // 鼠标模式参数区
+	dsuBox    *walk.Composite // DSU 模式参数区
+
 	sensRow *sliderRow
 	dzRow   *sliderRow
 	invertX *walk.CheckBox
 	invertY *walk.CheckBox
+
+	dsuPort     *walk.LineEdit
+	dsuSlot     *walk.ComboBox
+	dsuGyroInv  [3]*walk.CheckBox
+	dsuAccelInv [3]*walk.CheckBox
 
 	startBtn *walk.PushButton
 	resetBtn *walk.PushButton
@@ -52,8 +69,8 @@ func newUI(p Params) *ui {
 	}
 	a.mw = mw
 	_ = mw.SetTitle("Rayneo Air1S 头追")
-	_ = mw.SetMinMaxSize(walk.Size{Width: 470, Height: 320}, walk.Size{})
-	_ = mw.SetClientSize(walk.Size{Width: 480, Height: 332})
+	_ = mw.SetMinMaxSize(walk.Size{Width: 470, Height: 360}, walk.Size{})
+	_ = mw.SetClientSize(walk.Size{Width: 480, Height: 372})
 	_ = mw.SetLayout(walk.NewVBoxLayout())
 
 	a.ico = loadAppIcon()
@@ -82,13 +99,53 @@ func (a *ui) addStatusBox() {
 	a.hintLabel = newStatusLabel(box, "提示：连接眼镜后「启动」按钮才可用")
 }
 
-// addParamBox 构建参数设置区。
+// addParamBox 构建参数设置区：顶部为「模拟设备」下拉框，其下为对应设备的参数子区。
 func (a *ui) addParamBox() {
 	box := newGroupBox(a.mw, "控制参数")
+
+	row, _ := newLabeledRow(box, "模拟设备")
+	a.deviceBox = must(walk.NewComboBox(row))
+	_ = a.deviceBox.SetModel(deviceNames)
+	_ = a.deviceBox.SetMinMaxSize(walk.Size{Width: 200}, walk.Size{Width: 200})
+
+	a.mouseBox = a.addMouseParams(box)
+	a.dsuBox = a.addDSUParams(box)
+}
+
+// addMouseParams 构建鼠标模式的参数区（灵敏度、死区、反转轴）。
+func (a *ui) addMouseParams(parent walk.Container) *walk.Composite {
+	box := newParamPanel(parent)
 	a.sensRow = newSliderRow(box, "灵敏度（像素/度）", 1, 300, 1, " px/°")
 	a.dzRow = newSliderRow(box, "死区（度）", 0, 30, 0.1, " °")
 	a.invertX = newCheckBox(box, "反转 X 轴（左右）")
 	a.invertY = newCheckBox(box, "反转 Y 轴（上下）")
+	return box
+}
+
+// addDSUParams 构建 DSU 模式的参数区（端口、槽位、各轴取反）。
+// 轴取反用于实机校正轴向：DSU 协议按 NS Pro 手柄约定，若模拟器中方向相反即勾选对应轴。
+func (a *ui) addDSUParams(parent walk.Container) *walk.Composite {
+	box := newParamPanel(parent)
+
+	row, _ := newLabeledRow(box, "监听端口")
+	a.dsuPort = must(walk.NewLineEdit(row))
+	a.dsuPort.SetMaxLength(5)
+	_ = a.dsuPort.SetMinMaxSize(walk.Size{Width: 120}, walk.Size{Width: 120})
+
+	slotRow, _ := newLabeledRow(box, "槽位（1~4）")
+	a.dsuSlot = must(walk.NewComboBox(slotRow))
+	_ = a.dsuSlot.SetModel([]string{"1", "2", "3", "4"})
+	_ = a.dsuSlot.SetMinMaxSize(walk.Size{Width: 120}, walk.Size{Width: 120})
+
+	gyroRow, _ := newLabeledRow(box, "陀螺取反")
+	for i, name := range []string{"Pitch", "Yaw", "Roll"} {
+		a.dsuGyroInv[i] = newCheckBox(gyroRow, name)
+	}
+	accelRow, _ := newLabeledRow(box, "加速度取反")
+	for i, name := range []string{"X", "Y", "Z"} {
+		a.dsuAccelInv[i] = newCheckBox(accelRow, name)
+	}
+	return box
 }
 
 // addButtonRow 构建按钮行。
@@ -126,10 +183,19 @@ func (a *ui) addTray() {
 
 // attachEvents 绑定界面事件。
 func (a *ui) attachEvents() {
+	a.deviceBox.CurrentIndexChanged().Attach(a.onDeviceChanged)
+
 	a.sensRow.Changed().Attach(a.onParamsChanged)
 	a.dzRow.Changed().Attach(a.onParamsChanged)
 	a.invertX.CheckedChanged().Attach(a.onParamsChanged)
 	a.invertY.CheckedChanged().Attach(a.onParamsChanged)
+
+	a.dsuPort.TextChanged().Attach(a.onParamsChanged)
+	a.dsuSlot.CurrentIndexChanged().Attach(a.onParamsChanged)
+	for i := 0; i < 3; i++ {
+		a.dsuGyroInv[i].CheckedChanged().Attach(a.onParamsChanged)
+		a.dsuAccelInv[i].CheckedChanged().Attach(a.onParamsChanged)
+	}
 
 	// 点击标题栏最小化按钮时收进托盘
 	a.mw.SizeChanged().Attach(func() {
@@ -140,22 +206,88 @@ func (a *ui) attachEvents() {
 	a.mw.Closing().Attach(func(_ *bool, _ walk.CloseReason) { a.shutdown() })
 }
 
+// onDeviceChanged 切换模拟设备：更新参数区可见性并保存。
+func (a *ui) onDeviceChanged() {
+	a.applyDevice(a.deviceValue())
+	a.onParamsChanged()
+}
+
 // applyParams 把参数写入控件。
 func (a *ui) applyParams(p Params) {
+	a.deviceBox.SetCurrentIndex(deviceIndexOf(p.Device))
+	a.applyDevice(p.Device)
+
 	a.sensRow.SetValue(p.Sensitivity)
 	a.dzRow.SetValue(p.DeadzoneDeg)
 	a.invertX.SetChecked(p.InvertX)
 	a.invertY.SetChecked(p.InvertY)
+
+	_ = a.dsuPort.SetText(strconv.Itoa(portOrDefault(p.DSU.Port)))
+	a.dsuSlot.SetCurrentIndex(slotIndexOrDefault(p.DSU.Slot) - 1)
+	for i := 0; i < 3; i++ {
+		a.dsuGyroInv[i].SetChecked(p.DSU.InvertGyro[i])
+		a.dsuAccelInv[i].SetChecked(p.DSU.InvertAccel[i])
+	}
 }
 
-// readParams 读取控件当前值（滑块已由 SetRange 限制范围，无需再校验）。
+// applyDevice 按所选设备切换参数区的可见内容。
+func (a *ui) applyDevice(device string) {
+	dsu := device == DeviceDSU
+	a.mouseBox.SetVisible(!dsu)
+	a.dsuBox.SetVisible(dsu)
+}
+
+// deviceValue 返回下拉框当前对应的设备标识。
+func (a *ui) deviceValue() string {
+	i := a.deviceBox.CurrentIndex()
+	if i < 0 || i >= len(deviceValues) {
+		return DeviceMouse
+	}
+	return deviceValues[i]
+}
+
+// readParams 读取控件当前值（滑块已由 SetRange 限制范围，此处只校验端口输入）。
 func (a *ui) readParams() Params {
 	return Params{
+		Device:      a.deviceValue(),
 		DeadzoneDeg: a.dzRow.Value(),
 		Sensitivity: a.sensRow.Value(),
 		InvertX:     a.invertX.Checked(),
 		InvertY:     a.invertY.Checked(),
+		DSU: DSUParams{
+			Port:        a.dsuPortValue(),
+			Slot:        a.dsuSlot.CurrentIndex() + 1,
+			InvertGyro:  a.dsuGyroInvert(),
+			InvertAccel: a.dsuAccelInvert(),
+		},
 	}
+}
+
+// dsuPortValue 解析端口输入框，非法输入回退到默认端口。
+func (a *ui) dsuPortValue() int {
+	n, err := strconv.Atoi(strings.TrimSpace(a.dsuPort.Text()))
+	if err != nil || n < 1 || n > 65535 {
+		return glass.DSUDefaultPort
+	}
+	return n
+}
+
+// dsuGyroInvert 读取陀螺三轴取反状态。
+func (a *ui) dsuGyroInvert() [3]bool {
+	var v [3]bool
+	for i := range v {
+		v[i] = a.dsuGyroInv[i].Checked()
+	}
+	return v
+}
+
+// dsuAccelInvert 读取加速度三轴取反状态。
+func (a *ui) dsuAccelInvert() [3]bool {
+	var v [3]bool
+	for i := range v {
+		v[i] = a.dsuAccelInv[i].Checked()
+	}
+	return v
 }
 
 // onParamsChanged 参数变更：立即作用于运行时，延迟落盘。
@@ -182,9 +314,17 @@ func (a *ui) toggleRun() {
 		a.refresh(a.tracker.Status())
 		return
 	}
-	a.tracker.SetParams(a.readParams())
+	p := a.readParams()
+	a.params = p
+	a.tracker.SetParams(p)
 	if err := a.tracker.Start(); err != nil {
 		a.setHint("启动失败：" + err.Error())
+		return
+	}
+	if p.Device == DeviceDSU {
+		a.setHint(fmt.Sprintf("已启动：DSU 服务端监听 127.0.0.1:%d 槽位 %d；请保持静止约 %.1f 秒完成零偏校准后开始推送",
+			portOrDefault(p.DSU.Port), slotIndexOrDefault(p.DSU.Slot),
+			float64(glass.GyroCalibSamples)/sampleHz))
 		return
 	}
 	a.setHint(fmt.Sprintf("已启动：请保持静止约 %.1f 秒完成陀螺零偏校准",
@@ -235,6 +375,10 @@ func (a *ui) setHint(text string) {
 
 // refresh 按运行时状态刷新界面（由 watch 协程经 Synchronize 调用）。
 func (a *ui) refresh(st Status) {
+	// 运行中禁止切换模拟设备，避免参数区与实际会话不一致
+	a.deviceBox.SetEnabled(!st.Running)
+
+	dsu := a.params.Device == DeviceDSU
 	switch {
 	case st.Err != "":
 		a.startBtn.SetText("启动")
@@ -246,11 +390,20 @@ func (a *ui) refresh(st Status) {
 	case st.Running && st.Calibrating:
 		a.startBtn.SetText("停止")
 		a.resetBtn.SetEnabled(false)
+		if dsu {
+			a.stateLabel.SetText(fmt.Sprintf("状态：陀螺零偏校准中 %d/%d   订阅者 %d",
+				st.CalFrames, glass.GyroCalibSamples, st.Peers))
+			return
+		}
 		a.stateLabel.SetText(fmt.Sprintf("状态：陀螺零偏校准中 %d/%d（请保持静止）",
 			st.CalFrames, glass.GyroCalibSamples))
 	case st.Running:
 		a.startBtn.SetText("停止")
-		a.resetBtn.SetEnabled(true)
+		a.resetBtn.SetEnabled(!dsu)
+		if dsu {
+			a.stateLabel.SetText(fmt.Sprintf("姿态：订阅者 %d   帧 %d", st.Peers, st.Frames))
+			return
+		}
 		a.stateLabel.SetText(fmt.Sprintf("姿态：yaw %+.2f°   pitch %+.2f°   帧 %d",
 			st.YawDeg, st.PitchDeg, st.Frames))
 	default:
@@ -320,6 +473,53 @@ func newGroupBox(parent walk.Container, title string) *walk.GroupBox {
 	_ = box.SetTitle(title)
 	_ = box.SetLayout(walk.NewVBoxLayout())
 	return box
+}
+
+// newParamPanel 创建一个无内边距的纵向参数容器，用于按模拟设备整体显示/隐藏。
+func newParamPanel(parent walk.Container) *walk.Composite {
+	panel := must(walk.NewComposite(parent))
+	layout := walk.NewVBoxLayout()
+	_ = layout.SetMargins(walk.Margins{})
+	_ = panel.SetLayout(layout)
+	return panel
+}
+
+// newLabeledRow 创建一行「定宽说明文字 + 控件」，与滑块行的说明列对齐。
+func newLabeledRow(parent walk.Container, title string) (*walk.Composite, *walk.Label) {
+	row := must(walk.NewComposite(parent))
+	layout := walk.NewHBoxLayout()
+	_ = layout.SetMargins(walk.Margins{})
+	_ = row.SetLayout(layout)
+
+	label := newLabel(row, title)
+	_ = label.SetMinMaxSize(walk.Size{Width: labelWidth}, walk.Size{Width: labelWidth})
+	return row, label
+}
+
+// deviceIndexOf 返回设备标识在下拉框中的下标，未知时回退到第一项。
+func deviceIndexOf(device string) int {
+	for i, v := range deviceValues {
+		if v == device {
+			return i
+		}
+	}
+	return 0
+}
+
+// portOrDefault 返回合法的 DSU 端口，越界时回退到默认端口。
+func portOrDefault(port int) int {
+	if port < 1 || port > 65535 {
+		return glass.DSUDefaultPort
+	}
+	return port
+}
+
+// slotIndexOrDefault 返回合法的 DSU 槽位号（1~4）。
+func slotIndexOrDefault(slot int) int {
+	if slot < 1 || slot > 4 {
+		return 1
+	}
+	return slot
 }
 
 // newLabel 创建文本标签。

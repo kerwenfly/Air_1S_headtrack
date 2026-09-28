@@ -17,6 +17,10 @@ const (
 	ffalconPID = 0xAF50
 	// sampleHz 是时间戳异常时的采样率回退值（实测官方约 460Hz）
 	sampleHz = 460
+
+	// DeviceMouse 把姿态换算成鼠标位移；DeviceDSU 以 DSU 协议向模拟器提供运动数据。
+	DeviceMouse = "mouse"
+	DeviceDSU   = "dsu"
 )
 
 // findGlassDevices 枚举 VID/PID 匹配的眼镜 HID 接口。
@@ -44,12 +48,22 @@ func writeCmd(dev *glass.Device, cmd byte) error {
 	return err
 }
 
+// DSUParams 是 DSU 服务端参数（模拟 NS Pro 手柄姿态传感器时使用）。
+type DSUParams struct {
+	Port        int     `json:"port"`         // 监听端口
+	Slot        int     `json:"slot"`         // 槽位（1~4，对应模拟器的 pad:0~3）
+	InvertGyro  [3]bool `json:"invert_gyro"`  // 陀螺 pitch/yaw/roll 取反
+	InvertAccel [3]bool `json:"invert_accel"` // 加速度 x/y/z 取反
+}
+
 // Params 是可运行中调整的控制参数，同时也是持久化到磁盘的设置项。
 type Params struct {
-	DeadzoneDeg float64 `json:"deadzone_deg"` // 死区（度）
-	Sensitivity float64 `json:"sensitivity"`  // 灵敏度（像素/度）
-	InvertX     bool    `json:"invert_x"`     // 反转 X 轴（左右）
-	InvertY     bool    `json:"invert_y"`     // 反转 Y 轴（上下）
+	Device      string    `json:"device"`       // 模拟设备：mouse | dsu
+	DeadzoneDeg float64   `json:"deadzone_deg"` // 死区（度）
+	Sensitivity float64   `json:"sensitivity"`  // 灵敏度（像素/度）
+	InvertX     bool      `json:"invert_x"`     // 反转 X 轴（左右）
+	InvertY     bool      `json:"invert_y"`     // 反转 Y 轴（上下）
+	DSU         DSUParams `json:"dsu"`          // DSU 模式参数
 }
 
 // mouseConfig 转换为 glass 包的鼠标控制参数。
@@ -62,6 +76,16 @@ func (p Params) mouseConfig() glass.MouseConfig {
 	}
 }
 
+// dsuConfig 转换为 glass 包的 DSU 服务端参数。
+func (p Params) dsuConfig() glass.DSUConfig {
+	return glass.DSUConfig{
+		Port:        p.DSU.Port,
+		Slot:        p.DSU.Slot,
+		InvertGyro:  p.DSU.InvertGyro,
+		InvertAccel: p.DSU.InvertAccel,
+	}
+}
+
 // Status 是供 GUI 显示的状态快照。
 type Status struct {
 	Running     bool
@@ -70,6 +94,7 @@ type Status struct {
 	YawDeg      float64 // 相对中位的累计 yaw 偏差
 	PitchDeg    float64 // 相对中位的累计 pitch 偏差
 	Frames      int64   // 已解析的 IMU 帧数
+	Peers       int     // DSU 模式下的订阅者数量
 	Err         string  // 非空表示会话因异常结束
 }
 
@@ -84,6 +109,7 @@ type Tracker struct {
 	st Status
 
 	dev    *glass.Device
+	srv    *glass.DSUServer // 仅 DSU 模式使用
 	doneCh chan struct{}
 }
 
@@ -95,7 +121,13 @@ func NewTracker(p Params) *Tracker {
 }
 
 // SetParams 更新参数，立即作用于下一个采样帧。
-func (t *Tracker) SetParams(p Params) { t.params.Store(&p) }
+// DSU 模式的轴向取反在此热更新到服务端；端口与槽位只在下次启动时生效。
+func (t *Tracker) SetParams(p Params) {
+	t.params.Store(&p)
+	if t.srv != nil {
+		t.srv.SetConfig(p.dsuConfig())
+	}
+}
 
 // RequestReset 请求把当前姿态设为角度中位（等价于 Ctrl+Alt+R 热键）。
 func (t *Tracker) RequestReset() { t.reset.Store(true) }
@@ -127,6 +159,16 @@ func (t *Tracker) Start() error {
 		t.running.Store(false)
 		return err
 	}
+	// DSU 模式需要先起服务端；端口被占用等原因失败时立即释放设备
+	if p := t.params.Load(); p.Device == DeviceDSU {
+		srv := glass.NewDSUServer(p.dsuConfig())
+		if err := srv.Start(); err != nil {
+			dev.Close()
+			t.running.Store(false)
+			return fmt.Errorf("启动 DSU 服务端失败：%w", err)
+		}
+		t.srv = srv
+	}
 	t.dev = dev
 	t.stop.Store(false)
 	t.reset.Store(false)
@@ -152,11 +194,15 @@ func (t *Tracker) Stop() {
 	_ = writeCmd(t.dev, glass.CmdSensorOutputOff)
 	t.dev.Close()
 	t.dev = nil
+	if t.srv != nil {
+		t.srv.Stop()
+		t.srv = nil
+	}
 	t.running.Store(false)
 	t.update(func(s *Status) { *s = Status{} })
 }
 
-// loop 是采集主循环：零偏校准 → 姿态解算 → 注入鼠标位移。
+// loop 是采集主循环：零偏校准 → 按所选设备分发（DSU 推流 / 姿态解算后注入鼠标位移）。
 func (t *Tracker) loop(dev *glass.Device, doneCh chan struct{}) {
 	defer close(doneCh)
 
@@ -165,14 +211,23 @@ func (t *Tracker) loop(dev *glass.Device, doneCh chan struct{}) {
 		return
 	}
 
+	p := t.params.Load()
+	srv := t.srv
+	// DSU 模式只需原始数据；姿态解算与光标控制器仅鼠标模式需要
+	var ahrs *glass.AHRS
+	var ctrl *glass.MouseController
+	var hot glass.HotkeyWatcher
+	if p.Device != DeviceDSU {
+		ahrs = glass.NewAHRS()
+		ctrl = glass.NewMouseController(p.mouseConfig())
+	}
+
 	buf := make([]byte, dev.InputReportLen)
 	cal := &glass.GyroCalib{}
-	ahrs := glass.NewAHRS()
-	ctrl := glass.NewMouseController(t.params.Load().mouseConfig())
-	var hot glass.HotkeyWatcher
 	var gyroBias [3]float32
 	var prevStamp uint32
 	var frames int64
+	peers := 0
 
 	for {
 		n, err := dev.Read(buf)
@@ -202,11 +257,34 @@ func (t *Tracker) loop(dev *glass.Device, doneCh chan struct{}) {
 		}
 		prevStamp = f.Stamp
 
-		q := ahrs.Update([3]float32{
+		gyro := [3]float32{
 			f.Gyro[0] - gyroBias[0],
 			f.Gyro[1] - gyroBias[1],
 			f.Gyro[2] - gyroBias[2],
-		}, f.Accel, dt)
+		}
+
+		// DSU 模式：不做姿态解算，直接把原始数据按协议单位推送（时间戳 100µs → µs）。
+		// 零偏未就绪前不推送：此时角速度含完整零偏，模拟器会看到「静止仍在持续旋转」，
+		// 并据此污染其内部姿态基准与零偏自估。这与鼠标模式「校准完成前不接管」保持一致。
+		if p.Device == DeviceDSU {
+			if srv != nil {
+				if cal.Done {
+					srv.Push(f.Accel, glass.RadToDeg(gyro), uint64(f.Stamp)*100)
+				}
+				if frames%32 == 1 { // 订阅者数量无需每帧刷新，降低加锁频次
+					peers = srv.Subscribers()
+				}
+			}
+			t.update(func(s *Status) {
+				s.Calibrating = !cal.Done
+				s.CalFrames = cal.Count()
+				s.Frames = frames
+				s.Peers = peers
+			})
+			continue
+		}
+
+		q := ahrs.Update(gyro, f.Accel, dt)
 
 		// 零偏未就绪时姿态不可靠，先不接管鼠标
 		if !ctrl.Ready() {

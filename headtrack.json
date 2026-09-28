@@ -1,6 +1,21 @@
 {
+  "device": "dsu",
   "deadzone_deg": 1,
   "sensitivity": 20,
   "invert_x": false,
-  "invert_y": false
+  "invert_y": false,
+  "dsu": {
+    "port": 26760,
+    "slot": 1,
+    "invert_gyro": [
+      false,
+      false,
+      false
+    ],
+    "invert_accel": [
+      false,
+      false,
+      false
+    ]
+  }
 }
