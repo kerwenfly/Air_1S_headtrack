@@ -22,8 +22,8 @@ const (
 
 // 模拟设备下拉框的显示文本与对应标识，两者按下标一一对应。
 var (
-	deviceNames  = []string{"鼠标", "NS Pro 手柄（DSU）"}
-	deviceValues = []string{DeviceMouse, DeviceDSU}
+	deviceNames  = []string{"鼠标", "NS Pro 手柄（DSU）", "opentrack（UDP）"}
+	deviceValues = []string{DeviceMouse, DeviceDSU, DeviceOT}
 )
 
 // ui 持有窗口控件与运行时对象，所有界面操作都发生在 walk 的消息循环线程上。
@@ -39,6 +39,7 @@ type ui struct {
 	deviceBox *walk.ComboBox
 	mouseBox  *walk.Composite // 鼠标模式参数区
 	dsuBox    *walk.Composite // DSU 模式参数区
+	otBox     *walk.Composite // opentrack 模式参数区
 
 	sensRow *sliderRow
 	dzRow   *sliderRow
@@ -49,6 +50,10 @@ type ui struct {
 	dsuSlot     *walk.ComboBox
 	dsuGyroInv  [3]*walk.CheckBox
 	dsuAccelInv [3]*walk.CheckBox
+
+	otPort *walk.LineEdit
+	otDz   *sliderRow
+	otInv  [3]*walk.CheckBox
 
 	startBtn *walk.PushButton
 	resetBtn *walk.PushButton
@@ -110,6 +115,7 @@ func (a *ui) addParamBox() {
 
 	a.mouseBox = a.addMouseParams(box)
 	a.dsuBox = a.addDSUParams(box)
+	a.otBox = a.addOTParams(box)
 }
 
 // addMouseParams 构建鼠标模式的参数区（灵敏度、死区、反转轴）。
@@ -145,6 +151,27 @@ func (a *ui) addDSUParams(parent walk.Container) *walk.Composite {
 	for i, name := range []string{"X", "Y", "Z"} {
 		a.dsuAccelInv[i] = newCheckBox(accelRow, name)
 	}
+	return box
+}
+
+// addOTParams 构建 opentrack 模式的参数区（目标端口、死区、三轴取反）。
+// 轴向取反用于实机校正方向：勾选对应轴即取其反，运行中即时生效。
+func (a *ui) addOTParams(parent walk.Container) *walk.Composite {
+	box := newParamPanel(parent)
+
+	row, _ := newLabeledRow(box, "目标端口")
+	a.otPort = must(walk.NewLineEdit(row))
+	a.otPort.SetMaxLength(5)
+	_ = a.otPort.SetMinMaxSize(walk.Size{Width: 120}, walk.Size{Width: 120})
+
+	a.otDz = newSliderRow(box, "死区（度）", 0, 30, 0.1, " °")
+
+	invRow, _ := newLabeledRow(box, "偏航/俯仰取反")
+	for i, name := range []string{"偏航", "俯仰"} {
+		a.otInv[i] = newCheckBox(invRow, name)
+	}
+	rollRow, _ := newLabeledRow(box, "翻滚取反")
+	a.otInv[2] = newCheckBox(rollRow, "翻滚")
 	return box
 }
 
@@ -197,6 +224,12 @@ func (a *ui) attachEvents() {
 		a.dsuAccelInv[i].CheckedChanged().Attach(a.onParamsChanged)
 	}
 
+	a.otPort.TextChanged().Attach(a.onParamsChanged)
+	a.otDz.Changed().Attach(a.onParamsChanged)
+	for i := 0; i < 3; i++ {
+		a.otInv[i].CheckedChanged().Attach(a.onParamsChanged)
+	}
+
 	// 点击标题栏最小化按钮时收进托盘
 	a.mw.SizeChanged().Attach(func() {
 		if isIconic(uintptr(a.mw.Handle())) {
@@ -222,19 +255,25 @@ func (a *ui) applyParams(p Params) {
 	a.invertX.SetChecked(p.InvertX)
 	a.invertY.SetChecked(p.InvertY)
 
-	_ = a.dsuPort.SetText(strconv.Itoa(portOrDefault(p.DSU.Port)))
-	a.dsuSlot.SetCurrentIndex(slotIndexOrDefault(p.DSU.Slot) - 1)
+	_ = a.dsuPort.SetText(strconv.Itoa(p.dsuPortOrDefault()))
+	a.dsuSlot.SetCurrentIndex(p.dsuSlotOrDefault() - 1)
 	for i := 0; i < 3; i++ {
 		a.dsuGyroInv[i].SetChecked(p.DSU.InvertGyro[i])
 		a.dsuAccelInv[i].SetChecked(p.DSU.InvertAccel[i])
+	}
+
+	_ = a.otPort.SetText(strconv.Itoa(p.otPortOrDefault()))
+	a.otDz.SetValue(p.OT.DeadzoneDeg)
+	for i := 0; i < 3; i++ {
+		a.otInv[i].SetChecked(p.OT.Invert[i])
 	}
 }
 
 // applyDevice 按所选设备切换参数区的可见内容。
 func (a *ui) applyDevice(device string) {
-	dsu := device == DeviceDSU
-	a.mouseBox.SetVisible(!dsu)
-	a.dsuBox.SetVisible(dsu)
+	a.mouseBox.SetVisible(device == DeviceMouse)
+	a.dsuBox.SetVisible(device == DeviceDSU)
+	a.otBox.SetVisible(device == DeviceOT)
 }
 
 // deviceValue 返回下拉框当前对应的设备标识。
@@ -260,16 +299,21 @@ func (a *ui) readParams() Params {
 			InvertGyro:  a.dsuGyroInvert(),
 			InvertAccel: a.dsuAccelInvert(),
 		},
+		OT: OTParams{
+			Port:        a.otPortValue(),
+			DeadzoneDeg: a.otDz.Value(),
+			Invert:      a.otInvert(),
+		},
 	}
 }
 
-// dsuPortValue 解析端口输入框，非法输入回退到默认端口。
+// dsuPortValue 解析端口输入框，非法输入回退到默认端口；范围判定复用 glass 的规则。
 func (a *ui) dsuPortValue() int {
 	n, err := strconv.Atoi(strings.TrimSpace(a.dsuPort.Text()))
-	if err != nil || n < 1 || n > 65535 {
+	if err != nil {
 		return glass.DSUDefaultPort
 	}
-	return n
+	return glass.DSUConfig{Port: n}.PortOrDefault()
 }
 
 // dsuGyroInvert 读取陀螺三轴取反状态。
@@ -286,6 +330,24 @@ func (a *ui) dsuAccelInvert() [3]bool {
 	var v [3]bool
 	for i := range v {
 		v[i] = a.dsuAccelInv[i].Checked()
+	}
+	return v
+}
+
+// otPortValue 解析端口输入框，非法输入回退到默认端口；范围判定复用 glass 的规则。
+func (a *ui) otPortValue() int {
+	n, err := strconv.Atoi(strings.TrimSpace(a.otPort.Text()))
+	if err != nil {
+		return glass.OTDefaultPort
+	}
+	return glass.OTPortOrDefault(n)
+}
+
+// otInvert 读取 opentrack 三轴取反状态。
+func (a *ui) otInvert() [3]bool {
+	var v [3]bool
+	for i := range v {
+		v[i] = a.otInv[i].Checked()
 	}
 	return v
 }
@@ -322,13 +384,19 @@ func (a *ui) toggleRun() {
 		return
 	}
 	if p.Device == DeviceDSU {
-		a.setHint(fmt.Sprintf("已启动：DSU 服务端监听 127.0.0.1:%d 槽位 %d；请保持静止约 %.1f 秒完成零偏校准后开始推送",
-			portOrDefault(p.DSU.Port), slotIndexOrDefault(p.DSU.Slot),
-			float64(glass.GyroCalibSamples)/sampleHz))
+		a.setHint(fmt.Sprintf("已启动：DSU 服务端监听 127.0.0.1:%d 槽位 %d；请保持静止约 %.1f 秒完成零偏校准后开始推送（端口与槽位需停止后修改）",
+			p.dsuPortOrDefault(), p.dsuSlotOrDefault(),
+			float64(glass.GyroCalibSamples)/glass.DefaultSampleHz))
+		return
+	}
+	if p.Device == DeviceOT {
+		a.setHint(fmt.Sprintf("已启动：向 127.0.0.1:%d 发送姿态数据；请在 opentrack 中选择输入「UDP over network」并设置相同端口，保持静止约 %.1f 秒完成零偏校准后开始发送",
+			p.otPortOrDefault(),
+			float64(glass.GyroCalibSamples)/glass.DefaultSampleHz))
 		return
 	}
 	a.setHint(fmt.Sprintf("已启动：请保持静止约 %.1f 秒完成陀螺零偏校准",
-		float64(glass.GyroCalibSamples)/sampleHz))
+		float64(glass.GyroCalibSamples)/glass.DefaultSampleHz))
 }
 
 // doReset 把当前姿态设为角度中位。
@@ -374,19 +442,12 @@ func (a *ui) setHint(text string) {
 }
 
 // refresh 按运行时状态刷新界面（由 watch 协程经 Synchronize 调用）。
+// 这里只做展示，不产生任何控制副作用——会话启停由事件处理与 watch 负责。
 func (a *ui) refresh(st Status) {
-	// 运行中禁止切换模拟设备，避免参数区与实际会话不一致
-	a.deviceBox.SetEnabled(!st.Running)
+	a.setRunLocked(st.Running)
 
 	dsu := a.params.Device == DeviceDSU
 	switch {
-	case st.Err != "":
-		a.startBtn.SetText("启动")
-		a.startBtn.SetEnabled(false)
-		a.resetBtn.SetEnabled(false)
-		a.stateLabel.SetText("状态：已停止")
-		a.setHint(st.Err)
-		a.tracker.Stop() // 清理句柄并清空状态，下次刷新即回到「未运行」
 	case st.Running && st.Calibrating:
 		a.startBtn.SetText("停止")
 		a.resetBtn.SetEnabled(false)
@@ -404,6 +465,11 @@ func (a *ui) refresh(st Status) {
 			a.stateLabel.SetText(fmt.Sprintf("姿态：订阅者 %d   帧 %d", st.Peers, st.Frames))
 			return
 		}
+		if a.params.Device == DeviceOT {
+			a.stateLabel.SetText(fmt.Sprintf("姿态：yaw %+.2f°   pitch %+.2f°   roll %+.2f°   已发送 %d 包",
+				st.YawDeg, st.PitchDeg, st.RollDeg, st.Sent))
+			return
+		}
 		a.stateLabel.SetText(fmt.Sprintf("姿态：yaw %+.2f°   pitch %+.2f°   帧 %d",
 			st.YawDeg, st.PitchDeg, st.Frames))
 	default:
@@ -411,6 +477,17 @@ func (a *ui) refresh(st Status) {
 		a.resetBtn.SetEnabled(false)
 		a.stateLabel.SetText("状态：未运行")
 	}
+}
+
+// setRunLocked 在会话运行期间禁用那些"启动时即固定"的选项：
+// 模拟设备决定以哪种模式建立会话，DSU 端口/槽位与 opentrack 目标端口在会话建立后不再变更。
+// 其余参数（灵敏度、死区、轴向取反）保持可调，它们会热更新到运行中的会话。
+func (a *ui) setRunLocked(running bool) {
+	editable := !running
+	a.deviceBox.SetEnabled(editable)
+	a.dsuPort.SetEnabled(editable)
+	a.dsuSlot.SetEnabled(editable)
+	a.otPort.SetEnabled(editable)
 }
 
 // applyConn 更新连接状态与「启动」按钮的可用性。
@@ -440,6 +517,16 @@ func (a *ui) watch() {
 			}
 		}
 		st := a.tracker.Status()
+		// 会话异常结束：只在检测到的那一次做清理（Stop 会清空状态，下轮 Err 即为空），
+		// 因此 refresh 可以保持无副作用。
+		if st.Err != "" {
+			a.tracker.Stop()
+			a.mw.Synchronize(func() {
+				a.refresh(a.tracker.Status())
+				a.setHint(st.Err)
+			})
+			continue
+		}
 		a.mw.Synchronize(func() { a.refresh(st) })
 	}
 }
@@ -504,22 +591,6 @@ func deviceIndexOf(device string) int {
 		}
 	}
 	return 0
-}
-
-// portOrDefault 返回合法的 DSU 端口，越界时回退到默认端口。
-func portOrDefault(port int) int {
-	if port < 1 || port > 65535 {
-		return glass.DSUDefaultPort
-	}
-	return port
-}
-
-// slotIndexOrDefault 返回合法的 DSU 槽位号（1~4）。
-func slotIndexOrDefault(slot int) int {
-	if slot < 1 || slot > 4 {
-		return 1
-	}
-	return slot
 }
 
 // newLabel 创建文本标签。

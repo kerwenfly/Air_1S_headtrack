@@ -1,5 +1,5 @@
 {
-  "device": "dsu",
+  "device": "opentrack",
   "deadzone_deg": 1,
   "sensitivity": 20,
   "invert_x": false,
@@ -15,6 +15,15 @@
     "invert_accel": [
       false,
       false,
+      false
+    ]
+  },
+  "opentrack": {
+    "port": 4242,
+    "deadzone_deg": 0.5,
+    "invert": [
+      false,
+      true,
       false
     ]
   }

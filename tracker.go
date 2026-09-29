@@ -15,12 +15,12 @@ import (
 const (
 	ffalconVID = 0x1BBB
 	ffalconPID = 0xAF50
-	// sampleHz 是时间戳异常时的采样率回退值（实测官方约 460Hz）
-	sampleHz = 460
 
-	// DeviceMouse 把姿态换算成鼠标位移；DeviceDSU 以 DSU 协议向模拟器提供运动数据。
+	// DeviceMouse 把姿态换算成鼠标位移；DeviceDSU 以 DSU 协议向模拟器提供运动数据；
+	// DeviceOT 以 opentrack 的 UDP 协议把姿态角发送给 opentrack。
 	DeviceMouse = "mouse"
 	DeviceDSU   = "dsu"
+	DeviceOT    = "opentrack"
 )
 
 // findGlassDevices 枚举 VID/PID 匹配的眼镜 HID 接口。
@@ -56,14 +56,22 @@ type DSUParams struct {
 	InvertAccel [3]bool `json:"invert_accel"` // 加速度 x/y/z 取反
 }
 
+// OTParams 是 opentrack 模式参数。
+type OTParams struct {
+	Port        int     `json:"port"`         // 目标端口（opentrack 输入插件「UDP over network」的监听端口）
+	DeadzoneDeg float64 `json:"deadzone_deg"` // 死区（度），抑制微小抖动
+	Invert      [3]bool `json:"invert"`       // yaw / pitch / roll 取反（轴向校正）
+}
+
 // Params 是可运行中调整的控制参数，同时也是持久化到磁盘的设置项。
 type Params struct {
-	Device      string    `json:"device"`       // 模拟设备：mouse | dsu
+	Device      string    `json:"device"`       // 模拟设备：mouse | dsu | opentrack
 	DeadzoneDeg float64   `json:"deadzone_deg"` // 死区（度）
 	Sensitivity float64   `json:"sensitivity"`  // 灵敏度（像素/度）
 	InvertX     bool      `json:"invert_x"`     // 反转 X 轴（左右）
 	InvertY     bool      `json:"invert_y"`     // 反转 Y 轴（上下）
 	DSU         DSUParams `json:"dsu"`          // DSU 模式参数
+	OT          OTParams  `json:"opentrack"`    // opentrack 模式参数
 }
 
 // mouseConfig 转换为 glass 包的鼠标控制参数。
@@ -86,6 +94,21 @@ func (p Params) dsuConfig() glass.DSUConfig {
 	}
 }
 
+// dsuPortOrDefault 返回当前参数下合法的 DSU 监听端口。
+// 范围判定统一由 glass.DSUConfig.PortOrDefault 提供，避免在界面层重复一份常量。
+func (p Params) dsuPortOrDefault() int { return p.dsuConfig().PortOrDefault() }
+
+// dsuSlotOrDefault 返回当前参数下合法的 DSU 槽位号（1~4）。
+func (p Params) dsuSlotOrDefault() int { return p.dsuConfig().SlotIndex() + 1 }
+
+// otPoseConfig 转换为 glass 包的 opentrack 姿态换算参数。
+func (p Params) otPoseConfig() glass.OTPoseConfig {
+	return glass.OTPoseConfig{DeadzoneDeg: p.OT.DeadzoneDeg, Invert: p.OT.Invert}
+}
+
+// otPortOrDefault 返回当前参数下合法的 opentrack 目标端口。
+func (p Params) otPortOrDefault() int { return glass.OTPortOrDefault(p.OT.Port) }
+
 // Status 是供 GUI 显示的状态快照。
 type Status struct {
 	Running     bool
@@ -93,8 +116,10 @@ type Status struct {
 	CalFrames   int     // 已累计的校准帧数
 	YawDeg      float64 // 相对中位的累计 yaw 偏差
 	PitchDeg    float64 // 相对中位的累计 pitch 偏差
+	RollDeg     float64 // 相对中位的累计 roll 偏差（opentrack 模式）
 	Frames      int64   // 已解析的 IMU 帧数
 	Peers       int     // DSU 模式下的订阅者数量
+	Sent        int64   // opentrack 模式下已发送的报文数
 	Err         string  // 非空表示会话因异常结束
 }
 
@@ -110,6 +135,7 @@ type Tracker struct {
 
 	dev    *glass.Device
 	srv    *glass.DSUServer // 仅 DSU 模式使用
+	ot     *glass.OTSender  // 仅 opentrack 模式使用
 	doneCh chan struct{}
 }
 
@@ -159,8 +185,9 @@ func (t *Tracker) Start() error {
 		t.running.Store(false)
 		return err
 	}
-	// DSU 模式需要先起服务端；端口被占用等原因失败时立即释放设备
-	if p := t.params.Load(); p.Device == DeviceDSU {
+	// 按所选模式先建立对外输出端；失败时立即释放设备
+	p := t.params.Load()
+	if p.Device == DeviceDSU {
 		srv := glass.NewDSUServer(p.dsuConfig())
 		if err := srv.Start(); err != nil {
 			dev.Close()
@@ -168,6 +195,15 @@ func (t *Tracker) Start() error {
 			return fmt.Errorf("启动 DSU 服务端失败：%w", err)
 		}
 		t.srv = srv
+	}
+	if p.Device == DeviceOT {
+		sender := glass.NewOTSender()
+		if err := sender.Start(p.otPortOrDefault()); err != nil {
+			dev.Close()
+			t.running.Store(false)
+			return fmt.Errorf("连接 opentrack 失败：%w", err)
+		}
+		t.ot = sender
 	}
 	t.dev = dev
 	t.stop.Store(false)
@@ -198,11 +234,58 @@ func (t *Tracker) Stop() {
 		t.srv.Stop()
 		t.srv = nil
 	}
+	if t.ot != nil {
+		t.ot.Stop()
+		t.ot = nil
+	}
 	t.running.Store(false)
 	t.update(func(s *Status) { *s = Status{} })
 }
 
-// loop 是采集主循环：零偏校准 → 按所选设备分发（DSU 推流 / 姿态解算后注入鼠标位移）。
+// session 承载一次采集会话中跨帧保持的状态。
+// ahrs 供鼠标与 opentrack 模式解算姿态，ctrl 仅鼠标模式使用，
+// srv 仅 DSU 模式使用，pose / ot 仅 opentrack 模式使用。
+type session struct {
+	dev  *glass.Device
+	srv  *glass.DSUServer
+	ot   *glass.OTSender
+	pose *glass.OTPoseTracker
+	ahrs *glass.AHRS
+	ctrl *glass.MouseController
+	hot  glass.HotkeyWatcher
+
+	cal    glass.GyroCalib
+	bias   [3]float32 // 陀螺零偏（rad/s）
+	dt     float32    // 本帧采样间隔（秒）
+	prev   uint32     // 上一帧时间戳
+	frames int64
+	peers  int
+
+	buf []byte
+}
+
+// newSession 按所选设备准备各模式需要的对象。
+func (t *Tracker) newSession(dev *glass.Device, p *Params) *session {
+	s := &session{dev: dev, buf: make([]byte, dev.InputReportLen)}
+	switch p.Device {
+	case DeviceDSU:
+		// DSU 模式直接推送原始数据，不做姿态解算
+		s.srv = t.srv
+	case DeviceOT:
+		// opentrack 模式需要姿态解算，再把姿态角发给 opentrack
+		s.ahrs = glass.NewAHRS()
+		s.pose = glass.NewOTPoseTracker(p.otPoseConfig())
+		s.ot = t.ot
+	default:
+		// 姿态解算与光标控制器仅鼠标模式需要
+		s.ahrs = glass.NewAHRS()
+		s.ctrl = glass.NewMouseController(p.mouseConfig())
+	}
+	return s
+}
+
+// loop 是采集主循环：解析每帧 → 零偏估计 → 按所选设备分发 → 统一发布状态。
+// 状态只在这一处发布，各模式返回自己的快照，避免分支里各写一遍而漂移。
 func (t *Tracker) loop(dev *glass.Device, doneCh chan struct{}) {
 	defer close(doneCh)
 
@@ -212,106 +295,129 @@ func (t *Tracker) loop(dev *glass.Device, doneCh chan struct{}) {
 	}
 
 	p := t.params.Load()
-	srv := t.srv
-	// DSU 模式只需原始数据；姿态解算与光标控制器仅鼠标模式需要
-	var ahrs *glass.AHRS
-	var ctrl *glass.MouseController
-	var hot glass.HotkeyWatcher
-	if p.Device != DeviceDSU {
-		ahrs = glass.NewAHRS()
-		ctrl = glass.NewMouseController(p.mouseConfig())
-	}
-
-	buf := make([]byte, dev.InputReportLen)
-	cal := &glass.GyroCalib{}
-	var gyroBias [3]float32
-	var prevStamp uint32
-	var frames int64
-	peers := 0
-
+	s := t.newSession(dev, p)
 	for {
-		n, err := dev.Read(buf)
+		n, err := s.dev.Read(s.buf)
 		if t.stop.Load() {
 			return
 		}
 		if err != nil {
-			t.update(func(s *Status) { s.Err = "读取中断：" + err.Error() })
+			t.update(func(st *Status) { st.Err = "读取中断：" + err.Error() })
 			return
 		}
-		f := glass.ParseIMU(buf[:n])
+		f := glass.ParseIMU(s.buf[:n])
 		if f == nil {
 			continue
 		}
-		frames++
-
+		s.frames++
 		// 零偏估计：连续静止足够帧数后提交均值
-		if cal.Feed(f.Gyro) {
-			gyroBias = cal.Bias
+		if s.cal.Feed(f.Gyro) {
+			s.bias = s.cal.Bias
 		}
 		// 采样间隔：时间戳原始值单位为 100µs，官方 dt = Δraw / 10000 秒
-		dt := float32(1) / sampleHz
-		if prevStamp != 0 {
-			if d := float32(int32(f.Stamp-prevStamp)) / 10000; d > 0 && d < 0.05 {
-				dt = d
-			}
+		s.dt = glass.TimestampToSeconds(s.prev, f.Stamp, glass.DefaultSampleHz)
+		s.prev = f.Stamp
+
+		var st Status
+		switch p.Device {
+		case DeviceDSU:
+			st = t.stepDSU(s, f)
+		case DeviceOT:
+			st = t.stepOT(s, f)
+		default:
+			st = t.stepMouse(s, f)
 		}
-		prevStamp = f.Stamp
+		t.update(func(cur *Status) { *cur = st })
+	}
+}
 
-		gyro := [3]float32{
-			f.Gyro[0] - gyroBias[0],
-			f.Gyro[1] - gyroBias[1],
-			f.Gyro[2] - gyroBias[2],
+// stepDSU 处理一帧 DSU 推送并返回该帧的状态快照。
+// 零偏未就绪前不推送：此时角速度含完整零偏，模拟器会看到「静止仍在持续旋转」，
+// 并据此污染其内部姿态基准与零偏自估。这与鼠标模式「校准完成前不接管」保持一致。
+func (t *Tracker) stepDSU(s *session, f *glass.IMUFrame) Status {
+	if s.srv != nil {
+		if s.cal.Done {
+			// 时间戳 100µs → µs
+			s.srv.Push(f.Accel, glass.RadToDeg(glass.SubBias(f.Gyro, s.bias)), uint64(f.Stamp)*100)
 		}
-
-		// DSU 模式：不做姿态解算，直接把原始数据按协议单位推送（时间戳 100µs → µs）。
-		// 零偏未就绪前不推送：此时角速度含完整零偏，模拟器会看到「静止仍在持续旋转」，
-		// 并据此污染其内部姿态基准与零偏自估。这与鼠标模式「校准完成前不接管」保持一致。
-		if p.Device == DeviceDSU {
-			if srv != nil {
-				if cal.Done {
-					srv.Push(f.Accel, glass.RadToDeg(gyro), uint64(f.Stamp)*100)
-				}
-				if frames%32 == 1 { // 订阅者数量无需每帧刷新，降低加锁频次
-					peers = srv.Subscribers()
-				}
-			}
-			t.update(func(s *Status) {
-				s.Calibrating = !cal.Done
-				s.CalFrames = cal.Count()
-				s.Frames = frames
-				s.Peers = peers
-			})
-			continue
+		if s.frames%32 == 1 { // 订阅者数量无需每帧刷新，降低加锁频次
+			s.peers = s.srv.Subscribers()
 		}
+	}
+	return Status{
+		Running:     true,
+		Calibrating: !s.cal.Done,
+		CalFrames:   s.cal.Count(),
+		Frames:      s.frames,
+		Peers:       s.peers,
+	}
+}
 
-		q := ahrs.Update(gyro, f.Accel, dt)
+// stepMouse 处理一帧姿态解算与光标控制并返回该帧的状态快照。
+func (t *Tracker) stepMouse(s *session, f *glass.IMUFrame) Status {
+	q := s.ahrs.Update(glass.SubBias(f.Gyro, s.bias), f.Accel, s.dt)
 
-		// 零偏未就绪时姿态不可靠，先不接管鼠标
-		if !ctrl.Ready() {
-			if cal.Done {
-				ctrl.Reset(q)
-			}
-			t.update(func(s *Status) {
-				s.Calibrating = !cal.Done
-				s.CalFrames = cal.Count()
-				s.Frames = frames
-			})
-			continue
+	// 零偏未就绪时姿态不可靠，先不接管鼠标
+	if !s.ctrl.Ready() {
+		if s.cal.Done {
+			s.ctrl.Reset(q)
 		}
-
-		// 复位：界面按钮或 Ctrl+Alt+R 热键
-		if t.reset.CompareAndSwap(true, false) || hot.Pressed() {
-			ctrl.Reset(q)
+		return Status{
+			Running:     true,
+			Calibrating: !s.cal.Done,
+			CalFrames:   s.cal.Count(),
+			Frames:      s.frames,
 		}
-		ctrl.SetConfig(t.params.Load().mouseConfig())
-		glass.MoveMouseRel(ctrl.Move(q))
+	}
 
-		t.update(func(s *Status) {
-			s.Calibrating = false
-			s.CalFrames = glass.GyroCalibSamples
-			s.Frames = frames
-			s.YawDeg = ctrl.YawDeg
-			s.PitchDeg = ctrl.PitchDeg
-		})
+	// 复位：界面按钮或 Ctrl+Alt+R 热键
+	if t.reset.CompareAndSwap(true, false) || s.hot.Pressed() {
+		s.ctrl.Reset(q)
+	}
+	s.ctrl.SetConfig(t.params.Load().mouseConfig())
+	glass.MoveMouseRel(s.ctrl.Move(q))
+
+	return Status{
+		Running:   true,
+		CalFrames: glass.GyroCalibSamples,
+		Frames:    s.frames,
+		YawDeg:    s.ctrl.YawDeg,
+		PitchDeg:  s.ctrl.PitchDeg,
+	}
+}
+
+// stepOT 处理一帧姿态解算并把姿态角发给 opentrack，返回该帧的状态快照。
+// 与鼠标模式一致：零偏未就绪时姿态不可靠、先不发送，校准完成后以当前姿态为角度中位。
+func (t *Tracker) stepOT(s *session, f *glass.IMUFrame) Status {
+	q := s.ahrs.Update(glass.SubBias(f.Gyro, s.bias), f.Accel, s.dt)
+
+	if !s.pose.Ready() {
+		if s.cal.Done {
+			s.pose.Reset(q, f.Accel)
+		}
+		return Status{
+			Running:     true,
+			Calibrating: !s.cal.Done,
+			CalFrames:   s.cal.Count(),
+			Frames:      s.frames,
+		}
+	}
+
+	// 复位：界面按钮或 Ctrl+Alt+R 热键
+	if t.reset.CompareAndSwap(true, false) || s.hot.Pressed() {
+		s.pose.Reset(q, f.Accel)
+	}
+	s.pose.SetConfig(t.params.Load().otPoseConfig())
+	pose := s.pose.Angles(q, f.Accel)
+	s.ot.Push(pose)
+
+	return Status{
+		Running:   true,
+		CalFrames: glass.GyroCalibSamples,
+		Frames:    s.frames,
+		YawDeg:    pose.Yaw,
+		PitchDeg:  pose.Pitch,
+		RollDeg:   pose.Roll,
+		Sent:      int64(s.ot.Sent()),
 	}
 }

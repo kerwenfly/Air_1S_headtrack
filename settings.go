@@ -24,6 +24,10 @@ func defaultParams() Params {
 			Port: glass.DSUDefaultPort,
 			Slot: 1,
 		},
+		OT: OTParams{
+			Port:        glass.OTDefaultPort,
+			DeadzoneDeg: glass.OTDefaultDeadzoneDeg,
+		},
 	}
 }
 
