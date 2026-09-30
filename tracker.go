@@ -48,12 +48,22 @@ func writeCmd(dev *glass.Device, cmd byte) error {
 	return err
 }
 
+// applyDisplay 把显示档位换算为面板档位并下发（0x09 亮度命令）。
+// 档位越界（含未设置的 0）时跳过，保持眼镜当前显示不变；
+// 写入失败视为瞬时错误静默忽略，数据流异常会由读循环统一上报。
+func applyDisplay(dev *glass.Device, p *Params) {
+	m := glass.BrightnessModeFor(p.DisplayLv)
+	if m == nil {
+		return
+	}
+	_, _ = dev.Write(glass.BuildCommand(glass.CmdPanelLuminance, byte(m.Panel)))
+}
+
 // DSUParams 是 DSU 服务端参数（模拟 NS Pro 手柄姿态传感器时使用）。
 type DSUParams struct {
-	Port        int     `json:"port"`         // 监听端口
-	Slot        int     `json:"slot"`         // 槽位（1~4，对应模拟器的 pad:0~3）
-	InvertGyro  [3]bool `json:"invert_gyro"`  // 陀螺 pitch/yaw/roll 取反
-	InvertAccel [3]bool `json:"invert_accel"` // 加速度 x/y/z 取反
+	Port   int     `json:"port"`   // 监听端口
+	Slot   int     `json:"slot"`   // 槽位（1~4，对应模拟器的 pad:0~3）
+	Invert [3]bool `json:"invert"` // 轴向取反（pitch/yaw/roll），陀螺与加速度同步生效
 }
 
 // OTParams 是 opentrack 模式参数。
@@ -66,6 +76,7 @@ type OTParams struct {
 // Params 是可运行中调整的控制参数，同时也是持久化到磁盘的设置项。
 type Params struct {
 	Device      string    `json:"device"`       // 模拟设备：mouse | dsu | opentrack
+	DisplayLv   int       `json:"display_lv"`   // 眼镜显示档位（glass.BrightnessModes 序号 1~13，0 表示未设置）
 	DeadzoneDeg float64   `json:"deadzone_deg"` // 死区（度）
 	Sensitivity float64   `json:"sensitivity"`  // 灵敏度（像素/度）
 	InvertX     bool      `json:"invert_x"`     // 反转 X 轴（左右）
@@ -87,10 +98,9 @@ func (p Params) mouseConfig() glass.MouseConfig {
 // dsuConfig 转换为 glass 包的 DSU 服务端参数。
 func (p Params) dsuConfig() glass.DSUConfig {
 	return glass.DSUConfig{
-		Port:        p.DSU.Port,
-		Slot:        p.DSU.Slot,
-		InvertGyro:  p.DSU.InvertGyro,
-		InvertAccel: p.DSU.InvertAccel,
+		Port:   p.DSU.Port,
+		Slot:   p.DSU.Slot,
+		Invert: p.DSU.Invert,
 	}
 }
 
@@ -112,19 +122,24 @@ func (p Params) otPortOrDefault() int { return glass.OTPortOrDefault(p.OT.Port) 
 // Status 是供 GUI 显示的状态快照。
 type Status struct {
 	Running     bool
-	Calibrating bool    // 陀螺零偏校准中，此时尚未接管鼠标
-	CalFrames   int     // 已累计的校准帧数
-	YawDeg      float64 // 相对中位的累计 yaw 偏差
-	PitchDeg    float64 // 相对中位的累计 pitch 偏差
-	RollDeg     float64 // 相对中位的累计 roll 偏差（opentrack 模式）
-	Frames      int64   // 已解析的 IMU 帧数
-	Peers       int     // DSU 模式下的订阅者数量
-	Sent        int64   // opentrack 模式下已发送的报文数
-	Err         string  // 非空表示会话因异常结束
+	Calibrating bool       // 陀螺零偏校准中，此时尚未接管鼠标
+	CalFrames   int        // 已累计的校准帧数
+	YawDeg      float64    // 相对中位的累计 yaw 偏差
+	PitchDeg    float64    // 相对中位的累计 pitch 偏差
+	RollDeg     float64    // 相对中位的累计 roll 偏差（opentrack 模式）
+	Frames      int64      // 已解析的 IMU 帧数
+	Peers       int        // DSU 模式下的订阅者数量
+	Sent        int64      // opentrack 模式下已发送的报文数
+	Q           [4]float32 // AHRS 姿态四元数 (x, y, z, w)，供姿态立方体预览；未解算时为零
+	Err         string     // 非空表示会话因异常结束
 }
 
 // Tracker 管理一次「启动 → 停止」的完整会话。
 type Tracker struct {
+	opMu sync.Mutex // 串行化 Start/Stop/SetParams 对会话资源的访问：
+	// Stop 可能由 watch 协程（会话出错）与界面线程（停止按钮/关窗）并发调用，
+	// 无锁时会双关设备句柄、对已置空的 dev 解引用而 panic。
+
 	params  atomic.Pointer[Params]
 	stop    atomic.Bool
 	reset   atomic.Bool
@@ -147,11 +162,19 @@ func NewTracker(p Params) *Tracker {
 }
 
 // SetParams 更新参数，立即作用于下一个采样帧。
-// DSU 模式的轴向取反在此热更新到服务端；端口与槽位只在下次启动时生效。
+// DSU 模式的轴向取反在此热更新到服务端；端口与槽位只在下次启动时生效；
+// 显示档位变化时立即下发到运行中的会话（未运行则由下次 Start 应用）。
 func (t *Tracker) SetParams(p Params) {
+	old := t.params.Load()
 	t.params.Store(&p)
+	// srv 只在 opMu 保护下读写，避免与并发的 Stop（置空 srv）竞争
+	t.opMu.Lock()
+	defer t.opMu.Unlock()
 	if t.srv != nil {
 		t.srv.SetConfig(p.dsuConfig())
+	}
+	if t.dev != nil && old.DisplayLv != p.DisplayLv {
+		applyDisplay(t.dev, &p)
 	}
 }
 
@@ -177,6 +200,8 @@ func (t *Tracker) update(f func(*Status)) {
 
 // Start 打开设备并启动采集协程；失败时返回原因。
 func (t *Tracker) Start() error {
+	t.opMu.Lock()
+	defer t.opMu.Unlock()
 	if !t.running.CompareAndSwap(false, true) {
 		return fmt.Errorf("已在运行中")
 	}
@@ -215,19 +240,26 @@ func (t *Tracker) Start() error {
 }
 
 // Stop 停止会话：先让读循环退出，再关闭传感器推送并释放句柄。
+// 可从任意协程并发调用（watch 的错误清理与界面线程的停止/关窗）：
+// opMu 保证清理只执行一次，第二个进入者会看到 running 已复位而直接返回。
 // 传感器持续上报，读循环会在数毫秒内自然退出，因此无需关闭句柄去打断读取。
 func (t *Tracker) Stop() {
+	t.opMu.Lock()
+	defer t.opMu.Unlock()
 	if !t.running.Load() {
 		return
 	}
 	t.stop.Store(true)
 	select {
 	case <-t.doneCh:
+		// 读循环已自然退出，句柄仍有效：正常关闭传感器推送
+		_ = writeCmd(t.dev, glass.CmdSensorOutputOff)
 	case <-time.After(2 * time.Second):
-		t.dev.Close() // 兜底：数据流异常停滞时强行唤醒阻塞的读取
+		// 兜底：数据流异常停滞时强行唤醒阻塞的读取；
+		// 此时句柄已关闭，不再补发关闭命令（下次打开设备时会重新初始化）
+		t.dev.Close()
 		<-t.doneCh
 	}
-	_ = writeCmd(t.dev, glass.CmdSensorOutputOff)
 	t.dev.Close()
 	t.dev = nil
 	if t.srv != nil {
@@ -244,15 +276,17 @@ func (t *Tracker) Stop() {
 
 // session 承载一次采集会话中跨帧保持的状态。
 // ahrs 供鼠标与 opentrack 模式解算姿态，ctrl 仅鼠标模式使用，
-// srv 仅 DSU 模式使用，pose / ot 仅 opentrack 模式使用。
+// srv 仅 DSU 模式使用，pose / ot 仅 opentrack 模式使用，
+// dispAhrs 仅 DSU 模式使用（不做鼠标接管，仅供界面姿态预览）。
 type session struct {
-	dev  *glass.Device
-	srv  *glass.DSUServer
-	ot   *glass.OTSender
-	pose *glass.OTPoseTracker
-	ahrs *glass.AHRS
-	ctrl *glass.MouseController
-	hot  glass.HotkeyWatcher
+	dev      *glass.Device
+	srv      *glass.DSUServer
+	ot       *glass.OTSender
+	pose     *glass.OTPoseTracker
+	ahrs     *glass.AHRS
+	dispAhrs *glass.AHRS
+	ctrl     *glass.MouseController
+	hot      glass.HotkeyWatcher
 
 	cal    glass.GyroCalib
 	bias   [3]float32 // 陀螺零偏（rad/s）
@@ -269,8 +303,9 @@ func (t *Tracker) newSession(dev *glass.Device, p *Params) *session {
 	s := &session{dev: dev, buf: make([]byte, dev.InputReportLen)}
 	switch p.Device {
 	case DeviceDSU:
-		// DSU 模式直接推送原始数据，不做姿态解算
+		// DSU 模式直接推送原始数据，不做姿态解算；dispAhrs 仅供界面姿态预览
 		s.srv = t.srv
+		s.dispAhrs = glass.NewAHRS()
 	case DeviceOT:
 		// opentrack 模式需要姿态解算，再把姿态角发给 opentrack
 		s.ahrs = glass.NewAHRS()
@@ -296,6 +331,8 @@ func (t *Tracker) loop(dev *glass.Device, doneCh chan struct{}) {
 
 	p := t.params.Load()
 	s := t.newSession(dev, p)
+	// 与官方 XRSDK_Init 一致：传感器开启后按设置下发显示档位
+	applyDisplay(dev, p)
 	for {
 		n, err := s.dev.Read(s.buf)
 		if t.stop.Load() {
@@ -335,6 +372,14 @@ func (t *Tracker) loop(dev *glass.Device, doneCh chan struct{}) {
 // 零偏未就绪前不推送：此时角速度含完整零偏，模拟器会看到「静止仍在持续旋转」，
 // 并据此污染其内部姿态基准与零偏自估。这与鼠标模式「校准完成前不接管」保持一致。
 func (t *Tracker) stepDSU(s *session, f *glass.IMUFrame) Status {
+	// 复位：界面按钮或 Ctrl+Alt+R 热键。DSU 模式没有姿态中位的概念，
+	// 视角漂移来自零偏估计误差，重新校准零偏即等价的「复位」；
+	// 校准期间暂停推送，完成前模拟器收到的数据为空、视角保持不动。
+	if t.reset.CompareAndSwap(true, false) || s.hot.Pressed() {
+		s.cal.Restart()
+	}
+	// 立方体预览的绝对姿态（含校准期，零偏未就绪时会有缓慢漂转，无碍预览）
+	q := s.dispAhrs.Update(glass.SubBias(f.Gyro, s.bias), f.Accel, s.dt)
 	if s.srv != nil {
 		if s.cal.Done {
 			// 时间戳 100µs → µs
@@ -350,6 +395,7 @@ func (t *Tracker) stepDSU(s *session, f *glass.IMUFrame) Status {
 		CalFrames:   s.cal.Count(),
 		Frames:      s.frames,
 		Peers:       s.peers,
+		Q:           q,
 	}
 }
 
@@ -367,6 +413,7 @@ func (t *Tracker) stepMouse(s *session, f *glass.IMUFrame) Status {
 			Calibrating: !s.cal.Done,
 			CalFrames:   s.cal.Count(),
 			Frames:      s.frames,
+			Q:           q,
 		}
 	}
 
@@ -383,6 +430,7 @@ func (t *Tracker) stepMouse(s *session, f *glass.IMUFrame) Status {
 		Frames:    s.frames,
 		YawDeg:    s.ctrl.YawDeg,
 		PitchDeg:  s.ctrl.PitchDeg,
+		Q:         q,
 	}
 }
 
@@ -400,6 +448,7 @@ func (t *Tracker) stepOT(s *session, f *glass.IMUFrame) Status {
 			Calibrating: !s.cal.Done,
 			CalFrames:   s.cal.Count(),
 			Frames:      s.frames,
+			Q:           q,
 		}
 	}
 
@@ -419,5 +468,6 @@ func (t *Tracker) stepOT(s *session, f *glass.IMUFrame) Status {
 		PitchDeg:  pose.Pitch,
 		RollDeg:   pose.Roll,
 		Sent:      int64(s.ot.Sent()),
+		Q:         q,
 	}
 }

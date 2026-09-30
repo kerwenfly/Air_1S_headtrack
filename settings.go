@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"imutool/glass"
@@ -14,10 +15,14 @@ import (
 // saveDelay 是参数变更后延迟落盘的时长，避免输入过程中频繁写文件。
 const saveDelay = 300 * time.Millisecond
 
+// saveMu 串行化落盘：延迟保存定时器的协程与关窗时的同步保存可能并发写同一文件。
+var saveMu sync.Mutex
+
 // defaultParams 返回出厂默认参数（与 glass 包保持一致）。
 func defaultParams() Params {
 	return Params{
 		Device:      DeviceMouse,
+		DisplayLv:   1, // 官方默认面板档位
 		DeadzoneDeg: glass.DefaultDeadzoneDeg,
 		Sensitivity: glass.DefaultSensitivity,
 		DSU: DSUParams{
@@ -55,6 +60,8 @@ func loadParams() Params {
 
 // saveParams 把参数写入磁盘。
 func saveParams(p Params) error {
+	saveMu.Lock()
+	defer saveMu.Unlock()
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err

@@ -1,5 +1,6 @@
 {
   "device": "opentrack",
+  "display_lv": 1,
   "deadzone_deg": 1,
   "sensitivity": 20,
   "invert_x": false,
@@ -7,12 +8,7 @@
   "dsu": {
     "port": 26760,
     "slot": 1,
-    "invert_gyro": [
-      false,
-      false,
-      false
-    ],
-    "invert_accel": [
+    "invert": [
       false,
       false,
       false

@@ -7,6 +7,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/lxn/walk"
@@ -26,17 +27,50 @@ var (
 	deviceValues = []string{DeviceMouse, DeviceDSU, DeviceOT}
 )
 
+// displayNames 是「眼镜显示」下拉框的选项文本，下标与 glass.BrightnessModes 一一对应。
+var displayNames = func() []string {
+	names := make([]string, len(glass.BrightnessModes))
+	for i, m := range glass.BrightnessModes {
+		if m.Name != "" {
+			names[i] = "色彩：" + m.Name
+		} else {
+			names[i] = fmt.Sprintf("亮度 %d", m.Lv)
+		}
+	}
+	return names
+}()
+
+// displayIndexOf 把显示档位序号换算为下拉框下标；越界（含未设置的 0）回退到亮度 1。
+func displayIndexOf(lv int) int {
+	if lv >= 1 && lv <= len(glass.BrightnessModes) {
+		return lv - 1
+	}
+	return 0
+}
+
+// displayValue 把下拉框下标换算回显示档位序号。
+func displayValue(i int) int {
+	if i < 0 || i >= len(glass.BrightnessModes) {
+		return 1
+	}
+	return glass.BrightnessModes[i].Lv
+}
+
 // ui 持有窗口控件与运行时对象，所有界面操作都发生在 walk 的消息循环线程上。
 type ui struct {
 	mw  *walk.MainWindow
 	ni  *walk.NotifyIcon
 	ico *walk.Icon
 
+	cube    *cube
+	closing atomic.Bool // 置位后渲染循环退出，避免对已销毁窗口 Synchronize
+
 	connLabel  *walk.Label
 	stateLabel *walk.Label
 	hintLabel  *walk.Label
 
 	deviceBox *walk.ComboBox
+	displayBox *walk.ComboBox // 眼镜显示档位（亮度/色彩）
 	mouseBox  *walk.Composite // 鼠标模式参数区
 	dsuBox    *walk.Composite // DSU 模式参数区
 	otBox     *walk.Composite // opentrack 模式参数区
@@ -46,10 +80,9 @@ type ui struct {
 	invertX *walk.CheckBox
 	invertY *walk.CheckBox
 
-	dsuPort     *walk.LineEdit
-	dsuSlot     *walk.ComboBox
-	dsuGyroInv  [3]*walk.CheckBox
-	dsuAccelInv [3]*walk.CheckBox
+	dsuPort *walk.LineEdit
+	dsuSlot *walk.ComboBox
+	dsuInv  [3]*walk.CheckBox // 轴向取反：陀螺与加速度同步生效
 
 	otPort *walk.LineEdit
 	otDz   *sliderRow
@@ -74,20 +107,39 @@ func newUI(p Params) *ui {
 	}
 	a.mw = mw
 	_ = mw.SetTitle("Rayneo Air1S 头追")
-	_ = mw.SetMinMaxSize(walk.Size{Width: 470, Height: 360}, walk.Size{})
-	_ = mw.SetClientSize(walk.Size{Width: 480, Height: 372})
+	_ = mw.SetMinMaxSize(walk.Size{Width: 680, Height: 360}, walk.Size{})
+	_ = mw.SetClientSize(walk.Size{Width: 692, Height: 380})
 	_ = mw.SetLayout(walk.NewVBoxLayout())
 
 	a.ico = loadAppIcon()
 	_ = mw.SetIcon(a.ico)
 
-	a.addStatusBox()
-	a.addParamBox()
-	a.addButtonRow()
+	// 左右分栏：左列为状态/参数/按钮，右列为姿态立方体；分栏整体纵向伸展填满窗口
+	row := must(walk.NewComposite(a.mw))
+	rowLayout := walk.NewHBoxLayout()
+	_ = rowLayout.SetMargins(walk.Margins{})
+	_ = row.SetLayout(rowLayout)
+
+	left := must(walk.NewComposite(row))
+	leftLayout := walk.NewVBoxLayout()
+	_ = leftLayout.SetMargins(walk.Margins{})
+	_ = left.SetLayout(leftLayout)
+
+	a.addStatusBox(left)
+	a.addParamBox(left)
+	a.addButtonRow(left)
+	a.addCubePanel(row)
+	if bl, ok := mw.Layout().(*walk.BoxLayout); ok {
+		_ = bl.SetStretchFactor(row, 1)
+	}
 	a.addTray()
 
 	// 先套用设置再挂事件，避免初始化时的赋值触发保存
 	a.applyParams(p)
+	// 磁盘加载的参数可能越界（如手改 json 的负死区、超大灵敏度），控件只影响显示；
+	// 从控件读回经范围校正的值作为运行时参数，保证界面显示与 Tracker 实际生效值一致
+	a.params = a.readParams()
+	a.tracker.SetParams(a.params)
 	a.attachEvents()
 
 	// 首次连接检测在 UI 线程内同步完成（Run 之前不能调用 Synchronize）
@@ -97,25 +149,39 @@ func newUI(p Params) *ui {
 }
 
 // addStatusBox 构建状态显示区。
-func (a *ui) addStatusBox() {
-	box := newGroupBox(a.mw, "状态")
+func (a *ui) addStatusBox(parent walk.Container) {
+	box := newGroupBox(parent, "状态")
 	a.connLabel = newStatusLabel(box, "设备：未连接")
 	a.stateLabel = newStatusLabel(box, "状态：未运行")
 	a.hintLabel = newStatusLabel(box, "提示：连接眼镜后「启动」按钮才可用")
 }
 
 // addParamBox 构建参数设置区：顶部为「模拟设备」下拉框，其下为对应设备的参数子区。
-func (a *ui) addParamBox() {
-	box := newGroupBox(a.mw, "控制参数")
+func (a *ui) addParamBox(parent walk.Container) {
+	box := newGroupBox(parent, "控制参数")
 
 	row, _ := newLabeledRow(box, "模拟设备")
 	a.deviceBox = must(walk.NewComboBox(row))
 	_ = a.deviceBox.SetModel(deviceNames)
 	_ = a.deviceBox.SetMinMaxSize(walk.Size{Width: 200}, walk.Size{Width: 200})
 
+	// 眼镜显示档位：启动会话时与运行中调整均即时下发（可热更新，不随停止禁用）
+	row, _ = newLabeledRow(box, "眼镜显示")
+	a.displayBox = must(walk.NewComboBox(row))
+	_ = a.displayBox.SetModel(displayNames)
+	_ = a.displayBox.SetMinMaxSize(walk.Size{Width: 200}, walk.Size{Width: 200})
+
 	a.mouseBox = a.addMouseParams(box)
 	a.dsuBox = a.addDSUParams(box)
 	a.otBox = a.addOTParams(box)
+}
+
+// addCubePanel 构建姿态预览面板：固定宽度的分组框内放立方体自绘控件。
+func (a *ui) addCubePanel(parent walk.Container) {
+	box := newGroupBox(parent, "姿态")
+	a.cube = newCube(box)
+	// 宽度固定，避免 HBox 中被左列拉伸；高度不限制，随窗口纵向伸展
+	box.SetMinMaxSize(walk.Size{Width: 200}, walk.Size{Width: 200})
 }
 
 // addMouseParams 构建鼠标模式的参数区（灵敏度、死区、反转轴）。
@@ -128,8 +194,9 @@ func (a *ui) addMouseParams(parent walk.Container) *walk.Composite {
 	return box
 }
 
-// addDSUParams 构建 DSU 模式的参数区（端口、槽位、各轴取反）。
-// 轴取反用于实机校正轴向：DSU 协议按 NS Pro 手柄约定，若模拟器中方向相反即勾选对应轴。
+// addDSUParams 构建 DSU 模式的参数区（端口、槽位、轴向取反）。
+// 取反只有一组三个复选框：陀螺与加速度必须处于同一坐标系，若只翻其中一侧，
+// 模拟器的姿态解算会把「上下」或「左右」各反一边，因此两侧始终同步取反。
 func (a *ui) addDSUParams(parent walk.Container) *walk.Composite {
 	box := newParamPanel(parent)
 
@@ -143,13 +210,9 @@ func (a *ui) addDSUParams(parent walk.Container) *walk.Composite {
 	_ = a.dsuSlot.SetModel([]string{"1", "2", "3", "4"})
 	_ = a.dsuSlot.SetMinMaxSize(walk.Size{Width: 120}, walk.Size{Width: 120})
 
-	gyroRow, _ := newLabeledRow(box, "陀螺取反")
+	invRow, _ := newLabeledRow(box, "取反（轴向）")
 	for i, name := range []string{"Pitch", "Yaw", "Roll"} {
-		a.dsuGyroInv[i] = newCheckBox(gyroRow, name)
-	}
-	accelRow, _ := newLabeledRow(box, "加速度取反")
-	for i, name := range []string{"X", "Y", "Z"} {
-		a.dsuAccelInv[i] = newCheckBox(accelRow, name)
+		a.dsuInv[i] = newCheckBox(invRow, name)
 	}
 	return box
 }
@@ -176,8 +239,8 @@ func (a *ui) addOTParams(parent walk.Container) *walk.Composite {
 }
 
 // addButtonRow 构建按钮行。
-func (a *ui) addButtonRow() {
-	row := must(walk.NewComposite(a.mw))
+func (a *ui) addButtonRow(parent walk.Container) {
+	row := must(walk.NewComposite(parent))
 	_ = row.SetLayout(walk.NewHBoxLayout())
 	a.startBtn = newButton(row, "启动", a.toggleRun)
 	a.resetBtn = newButton(row, "复位视角", a.doReset)
@@ -211,6 +274,7 @@ func (a *ui) addTray() {
 // attachEvents 绑定界面事件。
 func (a *ui) attachEvents() {
 	a.deviceBox.CurrentIndexChanged().Attach(a.onDeviceChanged)
+	a.displayBox.CurrentIndexChanged().Attach(a.onParamsChanged)
 
 	a.sensRow.Changed().Attach(a.onParamsChanged)
 	a.dzRow.Changed().Attach(a.onParamsChanged)
@@ -220,8 +284,7 @@ func (a *ui) attachEvents() {
 	a.dsuPort.TextChanged().Attach(a.onParamsChanged)
 	a.dsuSlot.CurrentIndexChanged().Attach(a.onParamsChanged)
 	for i := 0; i < 3; i++ {
-		a.dsuGyroInv[i].CheckedChanged().Attach(a.onParamsChanged)
-		a.dsuAccelInv[i].CheckedChanged().Attach(a.onParamsChanged)
+		a.dsuInv[i].CheckedChanged().Attach(a.onParamsChanged)
 	}
 
 	a.otPort.TextChanged().Attach(a.onParamsChanged)
@@ -248,6 +311,7 @@ func (a *ui) onDeviceChanged() {
 // applyParams 把参数写入控件。
 func (a *ui) applyParams(p Params) {
 	a.deviceBox.SetCurrentIndex(deviceIndexOf(p.Device))
+	a.displayBox.SetCurrentIndex(displayIndexOf(p.DisplayLv))
 	a.applyDevice(p.Device)
 
 	a.sensRow.SetValue(p.Sensitivity)
@@ -258,8 +322,7 @@ func (a *ui) applyParams(p Params) {
 	_ = a.dsuPort.SetText(strconv.Itoa(p.dsuPortOrDefault()))
 	a.dsuSlot.SetCurrentIndex(p.dsuSlotOrDefault() - 1)
 	for i := 0; i < 3; i++ {
-		a.dsuGyroInv[i].SetChecked(p.DSU.InvertGyro[i])
-		a.dsuAccelInv[i].SetChecked(p.DSU.InvertAccel[i])
+		a.dsuInv[i].SetChecked(p.DSU.Invert[i])
 	}
 
 	_ = a.otPort.SetText(strconv.Itoa(p.otPortOrDefault()))
@@ -289,20 +352,20 @@ func (a *ui) deviceValue() string {
 func (a *ui) readParams() Params {
 	return Params{
 		Device:      a.deviceValue(),
+		DisplayLv:   displayValue(a.displayBox.CurrentIndex()),
 		DeadzoneDeg: a.dzRow.Value(),
 		Sensitivity: a.sensRow.Value(),
 		InvertX:     a.invertX.Checked(),
 		InvertY:     a.invertY.Checked(),
 		DSU: DSUParams{
-			Port:        a.dsuPortValue(),
-			Slot:        a.dsuSlot.CurrentIndex() + 1,
-			InvertGyro:  a.dsuGyroInvert(),
-			InvertAccel: a.dsuAccelInvert(),
+			Port:   a.dsuPortValue(),
+			Slot:   a.dsuSlot.CurrentIndex() + 1,
+			Invert: readChecks(a.dsuInv),
 		},
 		OT: OTParams{
 			Port:        a.otPortValue(),
 			DeadzoneDeg: a.otDz.Value(),
-			Invert:      a.otInvert(),
+			Invert:      readChecks(a.otInv),
 		},
 	}
 }
@@ -316,20 +379,11 @@ func (a *ui) dsuPortValue() int {
 	return glass.DSUConfig{Port: n}.PortOrDefault()
 }
 
-// dsuGyroInvert 读取陀螺三轴取反状态。
-func (a *ui) dsuGyroInvert() [3]bool {
+// readChecks 读取一组三轴复选框的勾选状态。
+func readChecks(cbs [3]*walk.CheckBox) [3]bool {
 	var v [3]bool
 	for i := range v {
-		v[i] = a.dsuGyroInv[i].Checked()
-	}
-	return v
-}
-
-// dsuAccelInvert 读取加速度三轴取反状态。
-func (a *ui) dsuAccelInvert() [3]bool {
-	var v [3]bool
-	for i := range v {
-		v[i] = a.dsuAccelInv[i].Checked()
+		v[i] = cbs[i].Checked()
 	}
 	return v
 }
@@ -343,18 +397,12 @@ func (a *ui) otPortValue() int {
 	return glass.OTPortOrDefault(n)
 }
 
-// otInvert 读取 opentrack 三轴取反状态。
-func (a *ui) otInvert() [3]bool {
-	var v [3]bool
-	for i := range v {
-		v[i] = a.otInv[i].Checked()
-	}
-	return v
-}
-
 // onParamsChanged 参数变更：立即作用于运行时，延迟落盘。
 func (a *ui) onParamsChanged() {
 	p := a.readParams()
+	// 输入框里的非法端口回写为实际生效值，保证显示与运行时一致
+	a.syncPortText(a.dsuPort, p.DSU.Port)
+	a.syncPortText(a.otPort, p.OT.Port)
 	a.params = p
 	a.tracker.SetParams(p)
 	if a.saveTimer != nil {
@@ -366,6 +414,18 @@ func (a *ui) onParamsChanged() {
 			a.mw.Synchronize(func() { a.setHint("设置保存失败：" + err.Error()) })
 		}
 	})
+}
+
+// syncPortText 把端口的实际生效值回写到输入框；
+// 回写会再次触发 onParamsChanged，但届时文本已一致，不会再回写，故收敛。
+// 空文本视为用户正在清空重输，不回写以免干扰输入。
+func (a *ui) syncPortText(edit *walk.LineEdit, port int) {
+	if strings.TrimSpace(edit.Text()) == "" {
+		return
+	}
+	if text := strconv.Itoa(port); edit.Text() != text {
+		edit.SetText(text)
+	}
 }
 
 // toggleRun 在「启动 / 停止」之间切换。
@@ -383,25 +443,30 @@ func (a *ui) toggleRun() {
 		a.setHint("启动失败：" + err.Error())
 		return
 	}
+	// 零偏校准所需等待秒数，三处提示共用
+	calSec := float64(glass.GyroCalibSamples) / glass.DefaultSampleHz
 	if p.Device == DeviceDSU {
 		a.setHint(fmt.Sprintf("已启动：DSU 服务端监听 127.0.0.1:%d 槽位 %d；请保持静止约 %.1f 秒完成零偏校准后开始推送（端口与槽位需停止后修改）",
-			p.dsuPortOrDefault(), p.dsuSlotOrDefault(),
-			float64(glass.GyroCalibSamples)/glass.DefaultSampleHz))
+			p.dsuPortOrDefault(), p.dsuSlotOrDefault(), calSec))
 		return
 	}
 	if p.Device == DeviceOT {
 		a.setHint(fmt.Sprintf("已启动：向 127.0.0.1:%d 发送姿态数据；请在 opentrack 中选择输入「UDP over network」并设置相同端口，保持静止约 %.1f 秒完成零偏校准后开始发送",
-			p.otPortOrDefault(),
-			float64(glass.GyroCalibSamples)/glass.DefaultSampleHz))
+			p.otPortOrDefault(), calSec))
 		return
 	}
-	a.setHint(fmt.Sprintf("已启动：请保持静止约 %.1f 秒完成陀螺零偏校准",
-		float64(glass.GyroCalibSamples)/glass.DefaultSampleHz))
+	a.setHint(fmt.Sprintf("已启动：请保持静止约 %.1f 秒完成陀螺零偏校准", calSec))
 }
 
-// doReset 把当前姿态设为角度中位。
+// doReset 复位运行中的会话：鼠标/opentrack 模式把当前姿态设为角度中位；
+// DSU 模式没有姿态中位的概念，改为重新校准陀螺零偏以消除视角漂移。
 func (a *ui) doReset() {
 	a.tracker.RequestReset()
+	if a.params.Device == DeviceDSU {
+		calSec := float64(glass.GyroCalibSamples) / glass.DefaultSampleHz
+		a.setHint(fmt.Sprintf("已复位：重新校准陀螺零偏，请保持眼镜静止约 %.1f 秒（校准期间暂停推送）", calSec))
+		return
+	}
 	a.setHint("已复位：以当前姿态为角度中位（等价于热键 Ctrl+Alt+R）")
 }
 
@@ -428,12 +493,32 @@ func (a *ui) showWindow() {
 
 // shutdown 在窗口关闭时停止采集、落盘并移除托盘图标。
 func (a *ui) shutdown() {
+	a.closing.Store(true)
 	a.tracker.Stop()
 	if a.saveTimer != nil {
 		a.saveTimer.Stop()
 	}
 	_ = saveParams(a.params)
 	_ = a.ni.Dispose()
+}
+
+// startCubeLoop 以约 30Hz 驱动姿态立方体重绘。
+// 姿态经 Synchronize 在 UI 线程写入控件，paint 回调同线程读取，无需加锁。
+func (a *ui) startCubeLoop() {
+	tick := time.NewTicker(33 * time.Millisecond)
+	defer tick.Stop()
+	for range tick.C {
+		if a.closing.Load() {
+			return
+		}
+		a.mw.Synchronize(func() {
+			a.cube.setPose(a.tracker.Status().Q)
+			// 隐藏到托盘时窗口不可见，跳过重绘省去无效的绘制消息
+			if a.mw.Visible() {
+				_ = a.cube.widget.Invalidate()
+			}
+		})
+	}
 }
 
 // setHint 更新提示行。
@@ -460,7 +545,7 @@ func (a *ui) refresh(st Status) {
 			st.CalFrames, glass.GyroCalibSamples))
 	case st.Running:
 		a.startBtn.SetText("停止")
-		a.resetBtn.SetEnabled(!dsu)
+		a.resetBtn.SetEnabled(true)
 		if dsu {
 			a.stateLabel.SetText(fmt.Sprintf("姿态：订阅者 %d   帧 %d", st.Peers, st.Frames))
 			return
@@ -509,7 +594,9 @@ func (a *ui) watch() {
 	defer tick.Stop()
 	idleTicks := 0
 	for range tick.C {
-		if !a.tracker.Running() {
+		if a.tracker.Running() {
+			idleTicks = 0
+		} else {
 			idleTicks++
 			if idleTicks >= 5 {
 				idleTicks = 0
